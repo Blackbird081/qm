@@ -1692,7 +1692,7 @@ export function createChatSurface(
       !work?.activity.some(
         (activity) =>
           activity.type === "user" ||
-          ["session", "sessions"].includes((activity.payload as ToolPayload | null)?.tool ?? ""),
+          ["session", "sessions", "subagents"].includes((activity.payload as ToolPayload | null)?.tool ?? ""),
       ) &&
       (!work || ((work.status === "complete" || work.status === "failed") && !work.pendingApprovals?.length));
     if (!cacheable) return chatMessage(message, index, isStreaming);
