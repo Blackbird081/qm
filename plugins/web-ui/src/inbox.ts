@@ -77,7 +77,10 @@ export interface LedgerThreadMessage {
   at: number;
 }
 
+type InboxPriority = "urgent" | "high" | "normal" | "low";
+
 export interface LedgerItem {
+  triage?: { priority?: InboxPriority; reason?: string; groupId?: string; pinned?: string[] };
   id: string;
   loopId: string;
   dedupeKey: string;
@@ -96,6 +99,10 @@ export interface LedgerItem {
 }
 
 export interface InboxItem {
+  priority?: InboxPriority;
+  priorityReason?: string;
+  priorityPinned?: boolean;
+  groupId?: string;
   sentChat?: boolean;
   id: string;
   loopId: string;
@@ -193,6 +200,8 @@ export const inboxState = {
     cronId?: string;
     syncCron?: InboxSyncCron | null;
     ingestionActive?: boolean;
+    prioritize?: boolean;
+    consolidate?: boolean;
   }>,
   available: [] as Array<{
     id: string;
@@ -222,7 +231,6 @@ const draftConflicts = new Map<string, number>();
 const draftEdits = new Map<string, InboxDraft & { basedOnAt?: number }>();
 const acting = new Set<string>();
 const chatting = new Set<string>();
-const chatDrafts = new Map<string, string>();
 
 let archiveToastHost: HTMLDivElement | null = null;
 let archiveToastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -358,7 +366,7 @@ export function itemsFor(viewId: string, status: "open" | "handled"): InboxItem[
       if (inboxState.filter === "human") return true;
       if (item.probablyResolved) return false;
     }
-    return item.attention !== false;
+    return item.attention !== false || (item.groupId !== undefined && loopTriage(item).consolidate);
   });
 }
 
@@ -412,6 +420,10 @@ export function toInboxItem(entry: LedgerItem): InboxItem {
     receivedAt: entry.sourceAt ?? (typeof payload.receivedAt === "number" ? payload.receivedAt : entry.updatedAt),
     thread: entry.thread,
     updatedAt: entry.updatedAt,
+    ...(entry.triage?.priority ? { priority: entry.triage.priority } : {}),
+    ...(entry.triage?.reason ? { priorityReason: entry.triage.reason } : {}),
+    ...(entry.triage?.pinned?.includes("priority") ? { priorityPinned: true } : {}),
+    ...(entry.triage?.groupId ? { groupId: entry.triage.groupId } : {}),
     ...(str(payload.fromDetail) ? { fromDetail: payload.fromDetail as string } : {}),
     sourceContextFetched: payload.sourceContextFetched === true,
     sourceContextPartial: payload.sourceContextPartial === true,
@@ -622,13 +634,9 @@ async function decideReview(
   item: InboxItem,
   output: ReviewOutput,
   decision: "ship" | "return",
-  note: string,
-): Promise<void> {
-  if (acting.has(item.id)) return;
-  if (decision === "return" && !note.trim()) {
-    notify("Add a note describing what should change.");
-    return;
-  }
+  note = "",
+): Promise<boolean> {
+  if (acting.has(item.id)) return false;
   acting.add(item.id);
   drawAll();
   try {
@@ -640,8 +648,10 @@ async function decideReview(
     notify(messages[result.output.state] ?? "Awaiting confirmation. Check the Loop before retrying.");
     await loadDetail(item.id, item.loopId);
     await refreshInbox({ silent: true });
+    return true;
   } catch (error) {
     notify(error instanceof Error ? error.message : "Could not confirm action");
+    return false;
   } finally {
     acting.delete(item.id);
     drawAll();
@@ -649,7 +659,7 @@ async function decideReview(
 }
 
 function reviewActionLabel(action: string): string {
-  const labels: Record<string, string> = { open_draft_pr: "Open draft PR", open_pr: "Open PR", send: "Send reply" };
+  const labels: Record<string, string> = { open_draft_pr: "Open draft PR", open_pr: "Open PR", send: "Send" };
   return labels[action] ?? `Approve ${action.replaceAll("_", " ")}`;
 }
 
@@ -670,50 +680,88 @@ function usesOutputReview(item: InboxItem): boolean {
   );
 }
 
-function reviewTpl(item: InboxItem): TemplateResult {
+const ARTIFACT_KINDS: Record<string, string> = {
+  open_draft_pr: "Draft pull request",
+  open_pr: "Pull request",
+  send: "Message",
+  reply: "Message",
+  send_email: "Email",
+  send_slack: "Slack message",
+};
+
+function subjectTpl(item: InboxItem): TemplateResult {
+  const members = groupOf(item);
+  const expanded = expandedSubjects.has(item.id);
+  const shown = expanded ? members : members.slice(0, 5);
+  return html`<section
+    class="inbox-subject"
+    aria-label=${members.length > 1 ? `${members.length} similar items` : "Item"}
+  >
+    ${members.length > 1 ? html`<div class="inbox-subject-label">${members.length} similar</div>` : nothing}
+    <ul>
+      ${shown.map(
+        (member) =>
+          html`<li>
+            <span class="inbox-subject-key">${member.source === "generic" ? member.sourceKey : member.from}</span>
+            <span class="inbox-subject-text">${member.snippet || member.title}</span>
+            <span class="inbox-subject-at" title=${fmtClock(member.receivedAt)}>${relTime(member.receivedAt)}</span>
+            ${member.externalUrl ? html`<a class="inbox-external-link" href=${member.externalUrl} target="_blank" rel="noopener noreferrer" aria-label="Open source">${icon(ArrowUpRight, 12)}</a>` : nothing}
+          </li>`,
+      )}
+    </ul>
+    ${
+      members.length > shown.length || expanded
+        ? html`<button
+            class="inbox-subject-more"
+            type="button"
+            @click=${() => {
+              if (expanded) expandedSubjects.delete(item.id);
+              else expandedSubjects.add(item.id);
+              drawAll();
+            }}
+          >
+            ${expanded ? "Show fewer" : `Show all ${members.length}`}
+          </button>`
+        : nothing
+    }
+  </section>`;
+}
+
+function artifactTpl(item: InboxItem, output: ReviewOutput, members: number): TemplateResult {
+  const link = output.externalRef && /^https?:\/\//i.test(output.externalRef) ? output.externalRef : undefined;
+  return html`<section class="inbox-artifact">
+    <div class="inbox-artifact-head">
+      <span>${ARTIFACT_KINDS[output.shipAction] ?? "Response"}</span>
+      ${link ? html`<a class="inbox-external-link" href=${link} target="_blank" rel="noopener noreferrer">View ${icon(ArrowUpRight, 12)}</a>` : nothing}
+    </div>
+    <h2>${output.title}</h2>
+    ${output.summary ? html`<div class="inbox-artifact-body">${output.summary}</div>` : nothing}
+    ${output.decisionNote ? html`<p class="inbox-review-note">Requested changes: ${output.decisionNote}</p>` : nothing}
+    ${
+      output.state === "ready"
+        ? html`<div class="inbox-artifact-actions">
+            <button
+              class="btn primary"
+              ?disabled=${acting.has(item.id)}
+              ${members > 1 ? tip(`Resolves all ${members}`) : nothing}
+              @click=${() => void decideReview(item, output, "ship")}
+            >
+              ${reviewActionLabel(output.shipAction)}
+            </button>
+          </div>`
+        : html`<p class="inbox-artifact-state" role="status">${reviewStateLabel(output.state)}</p>`
+    }
+  </section>`;
+}
+
+function reviewTpl(item: InboxItem, withChat = true): TemplateResult {
   if (!item.detailLoaded) return html`<div class="empty compact">Loading review…</div>`;
   const outputs = item.outputs ?? [];
+  const members = groupOf(item).length;
   return html`<div class="inbox-generic-review">
-    <div class="inbox-draft-head"><span>${inboxViewName(item.loopId)}</span><span>${item.reviewState}</span></div>
-    <p>${item.snippet}</p>
+    ${subjectTpl(item)}
     ${!outputs.length && item.proposalData ? html`<pre class="inbox-proposal-data">${JSON.stringify(item.proposalData, null, 2)}</pre>` : nothing}
-    ${outputs.map(
-      (output) =>
-        html`<section class="loop-output">
-          <h2>${output.title}</h2>
-          <p>${output.summary ?? ""}</p>
-          ${output.decisionNote ? html`<p class="inbox-review-note">Requested changes: ${output.decisionNote}</p>` : nothing}
-          <span class="loop-output-action">Effect: ${output.shipAction.replaceAll("_", " ")}</span>
-          ${output.externalRef && /^https?:\/\//i.test(output.externalRef) ? html`<a href=${output.externalRef} target="_blank" rel="noopener noreferrer">Open artifact</a>` : nothing}
-          ${
-            output.state === "ready"
-              ? html`<div class="loop-output-decide">
-                  <input
-                    aria-label="Requested changes"
-                    placeholder="What should change?"
-                    .value=${chatDrafts.get(output.id) ?? ""}
-                    @input=${(event: Event) => chatDrafts.set(output.id, (event.target as HTMLInputElement).value)}
-                  />
-                  <button
-                    class="btn"
-                    ?disabled=${acting.has(item.id)}
-                    @click=${() => void decideReview(item, output, "return", chatDrafts.get(output.id) ?? "")}
-                  >
-                    Request changes
-                  </button>
-                  <button
-                    class="btn primary"
-                    ?disabled=${acting.has(item.id)}
-                    @click=${() => void decideReview(item, output, "ship", "")}
-                  >
-                    ${reviewActionLabel(output.shipAction)}
-                  </button>
-                </div>`
-              : html`<p role="status">${reviewStateLabel(output.state)}</p>`
-          }
-        </section>`,
-    )}
-    ${chatTpl(item)}
+    ${outputs.map((output) => artifactTpl(item, output, members))} ${withChat ? chatTpl(item) : nothing}
   </div>`;
 }
 
@@ -978,6 +1026,8 @@ export async function askAgent(
 ): Promise<boolean> {
   const text = message.trim();
   if ((!text && !options?.attachments?.length) || chatting.has(item.id)) return false;
+  const ready = item.outputs?.find((output) => output.state === "ready");
+  if (ready && text && !options?.attachments?.length) return decideReview(item, ready, "return", text);
   const { draft, conflictRevision } = snapshot;
   chatting.add(item.id);
   drawAll();
@@ -1433,13 +1483,137 @@ function dismissItemTpl(item: InboxItem): TemplateResult | typeof nothing {
     class="inbox-dismiss"
     type="button"
     ?disabled=${chatting.has(item.id) || acting.has(item.id)}
-    @click=${() => void setItemStatus(item, "dismissed")}
+    @click=${() => void (groupOf(item).length > 1 ? archiveGroup(item) : setItemStatus(item, "dismissed"))}
   >
-    Dismiss
+    ${groupOf(item).length > 1 ? `Archive all ${groupOf(item).length}` : "Dismiss"}
   </button>`;
 }
 
-function itemRowTpl(surface: InboxSurface, item: InboxItem): TemplateResult {
+const PRIORITY_LABELS: Record<InboxPriority, string> = {
+  urgent: "Urgent",
+  high: "High",
+  normal: "Normal",
+  low: "Low",
+};
+
+async function overrideTriage(item: InboxItem, kind: "prioritize" | "ungroup", args?: Record<string, unknown>) {
+  if (acting.has(item.id)) return;
+  acting.add(item.id);
+  drawAll();
+  try {
+    upsertItem(await postAction(item, kind, args));
+    void refreshInbox({ silent: true });
+  } catch (e) {
+    notify(`Couldn't update the item: ${e instanceof Error ? e.message : e}`);
+  } finally {
+    acting.delete(item.id);
+    drawAll();
+  }
+}
+
+function loopTriage(item: InboxItem): { prioritize: boolean; consolidate: boolean } {
+  const loop = inboxState.selected.find((selected) => selected.id === item.loopId);
+  return { prioritize: loop?.prioritize === true, consolidate: loop?.consolidate === true };
+}
+
+function priorityMarkTpl(item: InboxItem): TemplateResult | typeof nothing {
+  if ((item.priority !== "urgent" && item.priority !== "high") || item.status !== "open") return nothing;
+  const reason = item.priorityPinned ? "Set by you" : item.priorityReason;
+  return html`<span class="inbox-priority inbox-priority-${item.priority}" ${reason ? tip(reason) : nothing}
+    >${PRIORITY_LABELS[item.priority]}</span
+  >`;
+}
+
+function triageControlsTpl(item: InboxItem): TemplateResult | typeof nothing {
+  if (item.status !== "open") return nothing;
+  const { prioritize } = loopTriage(item);
+  if (!prioritize && !item.groupId) return nothing;
+  return html`<span class="inbox-triage-controls" ${prioritize ? tip("Priority") : nothing}>
+    ${
+      prioritize
+        ? fieldSelect({
+            className: "inbox-filter-control inbox-priority-control",
+            ariaLabel: "Priority",
+            value: item.priority ?? "normal",
+            disabled: acting.has(item.id),
+            onChange: (value) => void overrideTriage(item, "prioritize", { priority: value }),
+            options: (Object.keys(PRIORITY_LABELS) as InboxPriority[]).map(
+              (value) =>
+                html`<option value=${value} ?selected=${(item.priority ?? "normal") === value}>
+                  ${PRIORITY_LABELS[value]}
+                </option>`,
+            ),
+          })
+        : nothing
+    }
+    ${
+      item.groupId
+        ? html`<button
+            class="inbox-dismiss"
+            type="button"
+            ?disabled=${acting.has(item.id)}
+            @click=${() => void overrideTriage(item, "ungroup")}
+          >
+            Remove from group
+          </button>`
+        : nothing
+    }
+  </span>`;
+}
+
+const expandedSubjects = new Set<string>();
+
+function groupOf(item: InboxItem): InboxItem[] {
+  if (!item.groupId || !loopTriage(item).consolidate) return [item];
+  const members = inboxState.items.filter((other) => other.groupId === item.groupId && other.status === "open");
+  const head = members.find((member) => member.id === item.groupId);
+  return head ? [head, ...members.filter((member) => member !== head)] : [item];
+}
+
+async function archiveGroup(head: InboxItem): Promise<void> {
+  if (acting.has(head.id)) return;
+  acting.add(head.id);
+  drawAll();
+  try {
+    upsertItem(await postAction(head, "dismiss", { group: true }));
+    showArchiveToast(head);
+    await refreshInbox({ silent: true });
+  } catch (e) {
+    notify(`Couldn't archive the group: ${e instanceof Error ? e.message : e}`);
+  } finally {
+    acting.delete(head.id);
+    drawAll();
+  }
+}
+
+function groupedRowsTpl(surface: InboxSurface, items: InboxItem[]): TemplateResult[] {
+  const members = new Map<string, InboxItem[]>();
+  for (const item of items) {
+    if (!item.groupId || !loopTriage(item).consolidate) continue;
+    members.set(item.groupId, [...(members.get(item.groupId) ?? []), item]);
+  }
+  const rows: TemplateResult[] = [];
+  const drawn = new Set<string>();
+  for (const item of items) {
+    const group = item.groupId ? members.get(item.groupId) : undefined;
+    if (!group || group.length < 2 || !group.some((member) => member.id === item.groupId)) {
+      rows.push(itemRowTpl(surface, item));
+      continue;
+    }
+    if (drawn.has(item.groupId!)) continue;
+    drawn.add(item.groupId!);
+    rows.push(
+      itemRowTpl(
+        surface,
+        group.find((member) => member.id === item.groupId)!,
+        group.length,
+      ),
+    );
+  }
+  return rows;
+}
+
+function itemRowTpl(surface: InboxSurface, item: InboxItem, groupSize = 1): TemplateResult {
   const inlineDetail = surface.pane;
   const open = surface.selectedId === item.id;
   const expanded = inlineDetail && open;
@@ -1470,13 +1644,14 @@ function itemRowTpl(surface: InboxSurface, item: InboxItem): TemplateResult {
           <span class="inbox-item-glyph">${sourceGlyph(item)}</span>
           <span class="inbox-item-main">
             <span class="inbox-item-top">
+              ${groupSize > 1 ? html`<span class="inbox-group-count">${groupSize} similar ·</span>` : nothing}
               <span class="inbox-item-heading">${heading}</span>
               <span class="inbox-item-sub">${sub}</span>
             </span>
             <span class="inbox-item-snippet">${slackTextTpl(item, item.snippet, { links: false })}</span>
           </span>
           <span class="inbox-item-side">
-            ${participantsTpl(item)} ${itemSideMark(item, handled)}
+            ${participantsTpl(item)} ${priorityMarkTpl(item)} ${itemSideMark(item, handled)}
             <span class="inbox-item-time" title=${fmtClock(item.receivedAt)}>${relTime(item.receivedAt)}</span>
             ${icon(expanded ? ChevronDown : ChevronRight, 13)}
           </span>
@@ -1486,10 +1661,10 @@ function itemRowTpl(surface: InboxSurface, item: InboxItem): TemplateResult {
             ? html`<button
                 class="session-menu-btn inbox-item-dismiss"
                 type="button"
-                aria-label=${`Archive ${item.title || heading}`}
-                ${tip("Archive")}
+                aria-label=${groupSize > 1 ? `Archive ${groupSize} similar` : `Archive ${item.title || heading}`}
+                ${tip(groupSize > 1 ? `Archive all ${groupSize}` : "Archive")}
                 ?disabled=${acting.has(item.id)}
-                @click=${() => void setItemStatus(item, "dismissed")}
+                @click=${() => void (groupSize > 1 ? archiveGroup(item) : setItemStatus(item, "dismissed"))}
               >
                 ${icon(Archive, 13.5)}
               </button>`
@@ -1501,9 +1676,10 @@ function itemRowTpl(surface: InboxSurface, item: InboxItem): TemplateResult {
           ? html`<div class="inbox-item-detail">
               ${
                 usesOutputReview(item)
-                  ? reviewTpl(item)
-                  : html`${handled ? nothing : html`<div class="inbox-item-detail-actions">${dismissItemTpl(item)}</div>`}
-                    ${contextTpl(item)} ${draftMessageTpl(item)} ${handled ? handledNoteTpl(item) : chatTpl(item, true)}`
+                  ? html`${triageControlsTpl(item) === nothing ? nothing : html`<div class="inbox-item-detail-actions">${triageControlsTpl(item)}</div>`}${reviewTpl(item)}`
+                  : html`${handled ? nothing : html`<div class="inbox-item-detail-actions">${triageControlsTpl(item)}${dismissItemTpl(item)}</div>`}
+                    ${groupOf(item).length > 1 ? subjectTpl(item) : nothing} ${contextTpl(item)}
+                    ${draftMessageTpl(item)} ${handled ? handledNoteTpl(item) : chatTpl(item, true)}`
               }
             </div>`
           : nothing
@@ -1680,7 +1856,7 @@ function surfaceTpl(surface: InboxSurface): TemplateResult {
         ? html`<div class="empty compact inbox-zero">${emptyMessage}</div>`
         : nothing
     }
-    <div class="inbox-list">${openItems.map((i) => itemRowTpl(surface, i))}</div>
+    <div class="inbox-list">${groupedRowsTpl(surface, openItems)}</div>
     ${
       resolvedItems.length
         ? html`<div class="inbox-resolved-sect">
@@ -1858,12 +2034,16 @@ function surfaceTpl(surface: InboxSurface): TemplateResult {
 function itemPageTpl(item: InboxItem): TemplateResult {
   const handled = item.status !== "open";
   const gmail = item.source === "gmail";
-  const heading = gmail ? item.from || item.title : (item.slack?.channelLabel ?? item.title);
+  let heading = item.slack?.channelLabel ?? item.title;
+  if (gmail) heading = item.from || item.title;
+  else if (item.source === "generic") heading = inboxViewName(item.loopId);
   const sub = gmail ? item.title : "";
+  const grouped = groupOf(item).length > 1 ? subjectTpl(item) : nothing;
   let detail: TemplateResult;
   if (!item.detailLoaded) detail = html`<div class="empty compact">Loading message…</div>`;
-  else if (usesOutputReview(item)) detail = reviewTpl(item);
-  else detail = html`${contextTpl(item)} ${draftMessageTpl(item)} ${handled ? handledNoteTpl(item) : nothing}`;
+  else if (usesOutputReview(item)) detail = reviewTpl(item, false);
+  else
+    detail = html`${grouped} ${contextTpl(item)} ${draftMessageTpl(item)} ${handled ? handledNoteTpl(item) : nothing}`;
   return html`
     <div class="pane-head inbox-item-head src-${item.source}">
       <div class="inbox-item-head-copy">
@@ -1877,7 +2057,7 @@ function itemPageTpl(item: InboxItem): TemplateResult {
         </h1>
         ${sub ? html`<div class="pane-subtitle">${sub}</div>` : nothing}
       </div>
-      ${dismissItemTpl(item)}
+      ${triageControlsTpl(item)} ${dismissItemTpl(item)}
     </div>
     <div class="inbox-surface inbox-item-surface">
       <div class="inbox-scroll inbox-item-thread">
@@ -1885,7 +2065,7 @@ function itemPageTpl(item: InboxItem): TemplateResult {
         ${detail}
       </div>
     </div>
-    ${item.detailLoaded && !usesOutputReview(item) ? html`<aside class="inbox-item-aside" aria-label="Conversation assistant">${chatTpl(item)}</aside>` : nothing}
+    ${item.detailLoaded ? html`<aside class="inbox-item-aside" aria-label="Conversation assistant">${chatTpl(item)}</aside>` : nothing}
   `;
 }
 
@@ -1970,7 +2150,7 @@ function drawFull(): void {
   }
   syncInboxUrl(openSentEmail?.id ?? fullSurface.selectedId);
   const host = fullSurface.host;
-  host.classList.toggle("inbox-thread-page", Boolean(openItem?.detailLoaded && !usesOutputReview(openItem)));
+  host.classList.toggle("inbox-thread-page", Boolean(openItem?.detailLoaded));
   const surface = fullSurface;
   let page: TemplateResult | typeof nothing;
   if (openItem) page = itemPageTpl(openItem);
