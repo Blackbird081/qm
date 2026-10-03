@@ -212,7 +212,11 @@ test("scratch with no selected computer uses the installation provider without c
 test("failed scratch initialization keeps its selected backend for cleanup", async () => {
   const { router, sprites } = build({ "personal:p": resource("p", "sprites") });
   sprites.provision = async () => {
-    throw new SandboxProvisionCleanupError({ id: "partial", rootDir: "/workspace", scratch: true });
+    throw new SandboxProvisionCleanupError(
+      { id: "partial", rootDir: "/workspace", scratch: true },
+      new Error("cleanup"),
+      new Error("provision"),
+    );
   };
   let pending: SandboxHandle | undefined;
   await assert.rejects(router.provision([], { scratch: { key: "turn" }, routeScopeId: "personal:p" }), (e: Error) => {

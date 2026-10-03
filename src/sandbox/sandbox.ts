@@ -1,4 +1,4 @@
-import { swallow } from "../util/errors.ts";
+import { errMessage, swallow } from "../util/errors.ts";
 import type { EgressPolicy, WorkspaceLayer } from "../types.ts";
 
 export interface SandboxHandle {
@@ -14,27 +14,31 @@ export interface SandboxHandle {
   scopeId?: string;
 }
 
-export class SandboxProvisionCleanupError extends Error {
+export class SandboxProvisionCleanupError extends AggregateError {
   readonly handle: SandboxHandle;
 
-  constructor(handle: SandboxHandle) {
-    super("Disposable sandbox initialization cleanup failed");
+  constructor(handle: SandboxHandle, cleanupError: unknown, provisionError: unknown) {
+    super(
+      [provisionError, cleanupError],
+      `Disposable sandbox cleanup failed after initialization failed (${errMessage(provisionError)})`,
+      {
+        cause: cleanupError,
+      },
+    );
     this.name = "SandboxProvisionCleanupError";
-    this.handle = {
-      id: handle.id,
-      rootDir: handle.rootDir,
-      scratch: true,
-      ...(handle.backend ? { backend: handle.backend } : {}),
-      ...(handle.providerSandboxId ? { providerSandboxId: handle.providerSandboxId } : {}),
-    };
+    this.handle = { ...handle, scratch: true };
   }
 }
 
-export async function cleanupFailedProvision(sandbox: Pick<Sandbox, "teardown">, handle: SandboxHandle): Promise<void> {
+export async function cleanupFailedProvision(
+  sandbox: Pick<Sandbox, "teardown">,
+  handle: SandboxHandle,
+  provisionError: unknown,
+): Promise<void> {
   try {
     await sandbox.teardown(handle, handle.scratch ? { destroy: true } : undefined);
   } catch (error) {
-    if (handle.scratch) throw new SandboxProvisionCleanupError(handle);
+    if (handle.scratch) throw new SandboxProvisionCleanupError(handle, error, provisionError);
     swallow("sandbox: teardown after failed provision", error);
   }
 }
